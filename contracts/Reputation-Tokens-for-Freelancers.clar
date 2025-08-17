@@ -223,6 +223,10 @@
 (define-constant err-certification-not-found (err u112))
 (define-constant err-insufficient-tier (err u113))
 (define-constant err-certification-fee (err u114))
+(define-constant err-escrow-exists (err u115))
+(define-constant err-escrow-not-found (err u116))
+(define-constant err-insufficient-balance (err u117))
+(define-constant err-payment-released (err u118))
 
 (define-map skill-certifications
     {freelancer: principal, skill: (string-ascii 64)}
@@ -245,6 +249,21 @@
 )
 
 (define-data-var certification-fee-base uint u500000)
+
+(define-map escrow-payments
+    uint
+    {
+        gig-id: uint,
+        client: principal,
+        freelancer: principal,
+        amount: uint,
+        created-height: uint,
+        released: bool,
+        penalty-applied: bool
+    }
+)
+
+(define-data-var penalty-rate uint u10)
 
 (define-public (setup-certification (skill (string-ascii 64)) (min-tier uint) (min-reviews uint) (fee uint) (validity uint))
     (begin
@@ -310,4 +329,72 @@
 
 (define-read-only (get-certification-requirements (skill (string-ascii 64)))
     (map-get? certification-requirements skill)
+)
+
+(define-public (deposit-escrow (gig-id uint) (amount uint))
+    (let
+        ((gig (unwrap! (map-get? gig-records gig-id) err-not-found))
+         (existing-escrow (map-get? escrow-payments gig-id)))
+        (asserts! (is-eq tx-sender (get client gig)) err-unauthorized)
+        (asserts! (not (get completed gig)) err-unauthorized)
+        (asserts! (is-none existing-escrow) err-escrow-exists)
+        (asserts! (> amount u0) err-insufficient-balance)
+        (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+        (map-set escrow-payments gig-id
+            {
+                gig-id: gig-id,
+                client: tx-sender,
+                freelancer: (get freelancer gig),
+                amount: amount,
+                created-height: burn-block-height,
+                released: false,
+                penalty-applied: false
+            }
+        )
+        (ok true)
+    )
+)
+
+(define-public (release-escrow-payment (gig-id uint))
+    (let
+        ((gig (unwrap! (map-get? gig-records gig-id) err-not-found))
+         (escrow (unwrap! (map-get? escrow-payments gig-id) err-escrow-not-found)))
+        (asserts! (get completed gig) err-unauthorized)
+        (asserts! (not (get released escrow)) err-payment-released)
+        (asserts! (>= (get rating gig) u3) err-invalid-rating)
+        (try! (as-contract (stx-transfer? (get amount escrow) tx-sender (get freelancer escrow))))
+        (map-set escrow-payments gig-id
+            (merge escrow {released: true})
+        )
+        (ok true)
+    )
+)
+
+(define-public (emergency-withdraw-escrow (gig-id uint))
+    (let
+        ((gig (unwrap! (map-get? gig-records gig-id) err-not-found))
+         (escrow (unwrap! (map-get? escrow-payments gig-id) err-escrow-not-found))
+         (penalty-amount (/ (* (get amount escrow) (var-get penalty-rate)) u100))
+         (refund-amount (- (get amount escrow) penalty-amount)))
+        (asserts! (is-eq tx-sender (get client escrow)) err-unauthorized)
+        (asserts! (not (get released escrow)) err-payment-released)
+        (asserts! (> (- burn-block-height (get created-height escrow)) u1008) err-cooldown-active)
+        (try! (as-contract (stx-transfer? refund-amount tx-sender (get client escrow))))
+        (try! (as-contract (stx-transfer? penalty-amount tx-sender contract-owner)))
+        (map-set escrow-payments gig-id
+            (merge escrow {released: true, penalty-applied: true})
+        )
+        (ok refund-amount)
+    )
+)
+
+(define-read-only (get-escrow-details (gig-id uint))
+    (map-get? escrow-payments gig-id)
+)
+
+(define-read-only (get-escrow-balance (gig-id uint))
+    (match (map-get? escrow-payments gig-id)
+        escrow (if (get released escrow) (ok u0) (ok (get amount escrow)))
+        err-escrow-not-found
+    )
 )
