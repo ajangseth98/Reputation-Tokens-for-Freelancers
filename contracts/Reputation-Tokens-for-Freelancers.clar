@@ -398,3 +398,180 @@
         err-escrow-not-found
     )
 )
+
+(define-constant err-portfolio-exists (err u119))
+(define-constant err-portfolio-not-found (err u120))
+(define-constant err-portfolio-item-exists (err u121))
+(define-constant err-portfolio-item-not-found (err u122))
+(define-constant err-invalid-portfolio-data (err u123))
+(define-constant err-portfolio-full (err u124))
+
+(define-map freelancer-portfolios
+    principal
+    {
+        bio: (string-ascii 512),
+        experience-years: uint,
+        hourly-rate: uint,
+        availability: bool,
+        languages: (list 10 (string-ascii 32)),
+        created-height: uint,
+        updated-height: uint,
+        total-items: uint
+    }
+)
+
+(define-map portfolio-items
+    {freelancer: principal, item-id: uint}
+    {
+        title: (string-ascii 128),
+        description: (string-ascii 512),
+        category: (string-ascii 64),
+        completion-date: uint,
+        client-feedback: (string-ascii 256),
+        project-value: uint,
+        skills-used: (list 10 (string-ascii 32)),
+        status: uint
+    }
+)
+
+(define-data-var max-portfolio-items uint u20)
+
+(define-public (create-portfolio (bio (string-ascii 512)) (experience-years uint) (hourly-rate uint) (languages (list 10 (string-ascii 32))))
+    (let
+        ((freelancer tx-sender))
+        (asserts! (is-some (map-get? freelancer-profiles freelancer)) err-not-found)
+        (asserts! (is-none (map-get? freelancer-portfolios freelancer)) err-portfolio-exists)
+        (asserts! (and (> (len bio) u0) (<= experience-years u50) (> hourly-rate u0)) err-invalid-portfolio-data)
+        (map-set freelancer-portfolios freelancer
+            {
+                bio: bio,
+                experience-years: experience-years,
+                hourly-rate: hourly-rate,
+                availability: true,
+                languages: languages,
+                created-height: burn-block-height,
+                updated-height: burn-block-height,
+                total-items: u0
+            }
+        )
+        (ok true)
+    )
+)
+
+(define-public (update-portfolio-info (bio (string-ascii 512)) (hourly-rate uint) (availability bool) (languages (list 10 (string-ascii 32))))
+    (let
+        ((portfolio (unwrap! (map-get? freelancer-portfolios tx-sender) err-portfolio-not-found)))
+        (asserts! (and (> (len bio) u0) (> hourly-rate u0)) err-invalid-portfolio-data)
+        (map-set freelancer-portfolios tx-sender
+            (merge portfolio {
+                bio: bio,
+                hourly-rate: hourly-rate,
+                availability: availability,
+                languages: languages,
+                updated-height: burn-block-height
+            })
+        )
+        (ok true)
+    )
+)
+
+(define-public (add-portfolio-item (title (string-ascii 128)) (description (string-ascii 512)) (category (string-ascii 64)) (completion-date uint) (client-feedback (string-ascii 256)) (project-value uint) (skills-used (list 10 (string-ascii 32))))
+    (let
+        ((portfolio (unwrap! (map-get? freelancer-portfolios tx-sender) err-portfolio-not-found))
+         (new-item-id (+ (get total-items portfolio) u1)))
+        (asserts! (< (get total-items portfolio) (var-get max-portfolio-items)) err-portfolio-full)
+        (asserts! (and (> (len title) u0) (> (len description) u0) (> (len category) u0)) err-invalid-portfolio-data)
+        (asserts! (is-none (map-get? portfolio-items {freelancer: tx-sender, item-id: new-item-id})) err-portfolio-item-exists)
+        (map-set portfolio-items {freelancer: tx-sender, item-id: new-item-id}
+            {
+                title: title,
+                description: description,
+                category: category,
+                completion-date: completion-date,
+                client-feedback: client-feedback,
+                project-value: project-value,
+                skills-used: skills-used,
+                status: u1
+            }
+        )
+        (map-set freelancer-portfolios tx-sender
+            (merge portfolio {
+                total-items: new-item-id,
+                updated-height: burn-block-height
+            })
+        )
+        (ok new-item-id)
+    )
+)
+
+(define-public (update-portfolio-item (item-id uint) (title (string-ascii 128)) (description (string-ascii 512)) (client-feedback (string-ascii 256)) (status uint))
+    (let
+        ((item (unwrap! (map-get? portfolio-items {freelancer: tx-sender, item-id: item-id}) err-portfolio-item-not-found)))
+        (asserts! (and (> (len title) u0) (> (len description) u0) (<= status u2)) err-invalid-portfolio-data)
+        (map-set portfolio-items {freelancer: tx-sender, item-id: item-id}
+            (merge item {
+                title: title,
+                description: description,
+                client-feedback: client-feedback,
+                status: status
+            })
+        )
+        (ok true)
+    )
+)
+
+(define-public (toggle-availability)
+    (let
+        ((portfolio (unwrap! (map-get? freelancer-portfolios tx-sender) err-portfolio-not-found)))
+        (map-set freelancer-portfolios tx-sender
+            (merge portfolio {
+                availability: (not (get availability portfolio)),
+                updated-height: burn-block-height
+            })
+        )
+        (ok (not (get availability portfolio)))
+    )
+)
+
+(define-read-only (get-portfolio (freelancer principal))
+    (map-get? freelancer-portfolios freelancer)
+)
+
+(define-read-only (get-portfolio-item (freelancer principal) (item-id uint))
+    (map-get? portfolio-items {freelancer: freelancer, item-id: item-id})
+)
+
+(define-read-only (get-freelancer-summary (freelancer principal))
+    (match (map-get? freelancer-profiles freelancer)
+        profile (match (map-get? freelancer-portfolios freelancer)
+            portfolio (ok {
+                reputation: (get tier-level profile),
+                total-reviews: (get reviews-count profile),
+                average-rating: (if (> (get reviews-count profile) u0) 
+                    (/ (get total-score profile) (get reviews-count profile)) u0),
+                experience-years: (get experience-years portfolio),
+                hourly-rate: (get hourly-rate portfolio),
+                availability: (get availability portfolio),
+                total-portfolio-items: (get total-items portfolio)
+            })
+            (ok {
+                reputation: (get tier-level profile),
+                total-reviews: (get reviews-count profile),
+                average-rating: (if (> (get reviews-count profile) u0) 
+                    (/ (get total-score profile) (get reviews-count profile)) u0),
+                experience-years: u0,
+                hourly-rate: u0,
+                availability: false,
+                total-portfolio-items: u0
+            })
+        )
+        err-not-found
+    )
+)
+
+(define-read-only (is-freelancer-available (freelancer principal))
+    (match (map-get? freelancer-portfolios freelancer)
+        portfolio (ok (get availability portfolio))
+        (ok false)
+    )
+)
