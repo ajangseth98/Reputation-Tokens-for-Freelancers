@@ -1247,3 +1247,170 @@
         )
     )
 )
+
+;; ============================================
+;; REPUTATION STAKING POOL
+;; ============================================
+
+(define-constant err-stake-not-found (err u138))
+(define-constant err-insufficient-stake (err u139))
+(define-constant err-stake-locked (err u140))
+(define-constant err-invalid-stake-amount (err u141))
+(define-constant err-no-rewards (err u142))
+(define-constant err-stake-exists (err u143))
+
+(define-map staking-positions
+    principal
+    {
+        staked-amount: uint,
+        stake-start-height: uint,
+        lock-duration: uint,
+        accumulated-rewards: uint,
+        last-reward-height: uint,
+        tier-level: uint,
+        rewards-claimed: uint
+    }
+)
+
+(define-map stake-tier-config
+    uint
+    {
+        tier-level: uint,
+        min-stake: uint,
+        max-stake: uint,
+        reward-rate: uint,
+        lock-period: uint,
+        bonus-multiplier: uint
+    }
+)
+
+(define-data-var total-staked-amount uint u0)
+(define-data-var pool-reward-balance uint u0)
+(define-data-var default-lock-duration uint u6048)
+(define-data-var min-stake-amount uint u100000)
+(define-data-var reward-rate-base uint u3)
+
+(define-public (setup-stake-tier (tier uint) (min-stake uint) (max-stake uint) (reward-rate uint) (lock-period uint) (bonus-mult uint))
+    (let
+        ((tier-id tier))
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (and (> tier u0) (<= tier u4) (> min-stake u0) (< min-stake max-stake) (> reward-rate u0)) err-invalid-metric-type)
+        (ok (map-set stake-tier-config tier-id
+            {
+                tier-level: tier,
+                min-stake: min-stake,
+                max-stake: max-stake,
+                reward-rate: reward-rate,
+                lock-period: lock-period,
+                bonus-multiplier: bonus-mult
+            }
+        ))
+    )
+)
+
+(define-public (stake-reputation (amount uint))
+    (let
+        ((sender tx-sender)
+         (existing-stake (map-get? staking-positions sender))
+         (profile (unwrap! (map-get? freelancer-profiles sender) err-not-found))
+         (new-tier (if (>= amount (var-get min-stake-amount)) u1 u0)))
+        (asserts! (> amount u0) err-invalid-stake-amount)
+        (asserts! (is-none existing-stake) err-stake-exists)
+        (asserts! (> new-tier u0) err-insufficient-stake)
+        (try! (stx-transfer? amount sender (as-contract sender)))
+        (map-set staking-positions sender
+            {
+                staked-amount: amount,
+                stake-start-height: burn-block-height,
+                lock-duration: (var-get default-lock-duration),
+                accumulated-rewards: u0,
+                last-reward-height: burn-block-height,
+                tier-level: new-tier,
+                rewards-claimed: u0
+            }
+        )
+        (var-set total-staked-amount (+ (var-get total-staked-amount) amount))
+        (ok amount)
+    )
+)
+
+(define-public (claim-staking-rewards)
+    (let
+        ((sender tx-sender)
+         (stake (unwrap! (map-get? staking-positions sender) err-stake-not-found))
+         (blocks-staked (- burn-block-height (get stake-start-height stake)))
+         (reward-rate (var-get reward-rate-base))
+         (stake-amount (get staked-amount stake))
+         (rewards-earned (/ (* stake-amount reward-rate blocks-staked) u100000)))
+        (asserts! (> rewards-earned u0) err-no-rewards)
+        (try! (as-contract (stx-transfer? rewards-earned (as-contract sender) sender)))
+        (map-set staking-positions sender
+            (merge stake {
+                accumulated-rewards: (+ (get accumulated-rewards stake) rewards-earned),
+                last-reward-height: burn-block-height,
+                rewards-claimed: (+ (get rewards-claimed stake) rewards-earned)
+            })
+        )
+        (var-set pool-reward-balance (- (var-get pool-reward-balance) rewards-earned))
+        (ok rewards-earned)
+    )
+)
+
+(define-public (unstake-reputation)
+    (let
+        ((sender tx-sender)
+         (stake (unwrap! (map-get? staking-positions sender) err-stake-not-found))
+         (lock-end (+ (get stake-start-height stake) (get lock-duration stake)))
+         (staked-amount (get staked-amount stake)))
+        (asserts! (> burn-block-height lock-end) err-stake-locked)
+        (try! (as-contract (stx-transfer? staked-amount (as-contract sender) sender)))
+        (map-delete staking-positions sender)
+        (var-set total-staked-amount (- (var-get total-staked-amount) staked-amount))
+        (ok staked-amount)
+    )
+)
+
+(define-public (deposit-pool-rewards (amount uint))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (> amount u0) err-invalid-stake-amount)
+        (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+        (var-set pool-reward-balance (+ (var-get pool-reward-balance) amount))
+        (ok amount)
+    )
+)
+
+(define-read-only (get-staking-position (freelancer principal))
+    (map-get? staking-positions freelancer)
+)
+
+(define-read-only (get-stake-tier-config (tier uint))
+    (map-get? stake-tier-config tier)
+)
+
+(define-read-only (get-total-staked)
+    (var-get total-staked-amount)
+)
+
+(define-read-only (get-pool-balance)
+    (var-get pool-reward-balance)
+)
+
+(define-read-only (calculate-pending-rewards (freelancer principal))
+    (match (map-get? staking-positions freelancer)
+        stake (ok {
+            pending-rewards: (/ (* (get staked-amount stake) (var-get reward-rate-base) (- burn-block-height (get last-reward-height stake))) u100000),
+            total-accumulated: (get accumulated-rewards stake),
+            stake-amount: (get staked-amount stake),
+            locked-until: (+ (get stake-start-height stake) (get lock-duration stake))
+        })
+        err-stake-not-found
+    )
+)
+
+(define-read-only (get-stake-unlock-time (freelancer principal))
+    (match (map-get? staking-positions freelancer)
+        stake (ok (+ (get stake-start-height stake) (get lock-duration stake)))
+        err-stake-not-found
+    )
+)
